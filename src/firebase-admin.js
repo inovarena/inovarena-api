@@ -3,8 +3,15 @@ const admin = require('firebase-admin');
 let serviceAccount;
 
 if (process.env.SERVICE_ACCOUNT_KEY) {
-  serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
+  try {
+    serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
+    console.log('SERVICE_ACCOUNT_KEY carregado do ambiente. project_id:', serviceAccount.project_id);
+  } catch (e) {
+    console.error('Erro ao fazer parse do SERVICE_ACCOUNT_KEY:', e.message);
+    process.exit(1);
+  }
 } else {
+  console.log('SERVICE_ACCOUNT_KEY não encontrado, usando arquivo local.');
   serviceAccount = require('../serviceAccountKey.json');
 }
 
