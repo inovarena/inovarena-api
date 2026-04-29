@@ -44,17 +44,25 @@ function buildOfflineValidUntil({ validade, diasOfflinePermitidos = DIAS_OFFLINE
 function getPrivateKey() {
   const privateKey = process.env.LICENSE_PRIVATE_KEY;
   if (!privateKey || !privateKey.trim()) {
-    throw new Error('LICENSE_PRIVATE_KEY não configurada no ambiente.');
+    const error = new Error('LICENSE_PRIVATE_KEY nao configurada no ambiente.');
+    error.code = 'LICENSE_PRIVATE_KEY_MISSING';
+    throw error;
   }
-  return privateKey.trim();
+  return privateKey.trim().replace(/\\n/g, '\n');
 }
 
 function signPayload(payload) {
-  const signature = crypto.sign(
-    'RSA-SHA256',
-    Buffer.from(stableStringify(payload), 'utf8'),
-    getPrivateKey()
-  );
+  let signature;
+  try {
+    signature = crypto.sign(
+      'RSA-SHA256',
+      Buffer.from(stableStringify(payload), 'utf8'),
+      getPrivateKey()
+    );
+  } catch (error) {
+    error.code = error.code || 'LICENSE_SIGN_FAILED';
+    throw error;
+  }
 
   return {
     payload,
