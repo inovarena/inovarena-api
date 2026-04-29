@@ -21,18 +21,24 @@ function montarRespostaLicenca({
   cliente,
   nome,
 }) {
-  const signedLicense = gerarLicencaOffline({
-    uid,
-    email,
-    plano,
-    validade,
-    fingerprint,
-    diasOfflinePermitidos,
-    cliente,
-    nome,
-    licencaAtiva,
-    maxDispositivos,
-  });
+  let signedLicense = null;
+
+  try {
+    signedLicense = gerarLicencaOffline({
+      uid,
+      email,
+      plano,
+      validade,
+      fingerprint,
+      diasOfflinePermitidos,
+      cliente,
+      nome,
+      licencaAtiva,
+      maxDispositivos,
+    });
+  } catch (error) {
+    console.error('[auth] assinatura offline indisponivel:', error && error.message ? error.message : error);
+  }
 
   return {
     licenca_ativa: licencaAtiva,
@@ -43,14 +49,13 @@ function montarRespostaLicenca({
     dispositivos,
     cliente,
     nome,
-    offlineValidUntil: signedLicense.offlineValidUntil,
-    signedLicense: {
+    offlineValidUntil: signedLicense ? signedLicense.offlineValidUntil : null,
+    signedLicense: signedLicense ? {
       payload: signedLicense.payload,
       signature: signedLicense.signature,
-    },
+    } : null,
   };
 }
-
 async function carregarUsuarioLicenca(uid) {
   const userRecord = await auth.getUser(uid);
   const userRef = db.collection('users').doc(uid);
@@ -101,7 +106,9 @@ function isErroConfiguracaoLicenca(error) {
 }
 
 function responderErroAuth(res, error, contexto) {
-  console.error(`[auth] ${contexto}:`, error && error.message ? error.message : error);
+  const code = error && error.code ? String(error.code) : '';
+  const message = error && error.message ? String(error.message) : '';
+  console.error(`[auth] ${contexto}:`, code || 'NO_CODE', message || error);
 
   if (isErroConfiguracaoLicenca(error)) {
     return res.status(503).json({
@@ -111,13 +118,28 @@ function responderErroAuth(res, error, contexto) {
     });
   }
 
+  if (code.startsWith('auth/') || /Firebase ID token|verifyIdToken|Decoding Firebase/i.test(message)) {
+    return res.status(401).json({
+      success: false,
+      message: 'Sessao Firebase invalida. Verifique se o app e o backend usam o mesmo projeto Firebase.',
+      code: 'FIREBASE_TOKEN_ERROR'
+    });
+  }
+
+  if (/Firestore|deadline|unavailable|credential|service account/i.test(message)) {
+    return res.status(503).json({
+      success: false,
+      message: 'Falha ao acessar Firebase/Firestore no backend.',
+      code: 'FIREBASE_BACKEND_ERROR'
+    });
+  }
+
   return res.status(500).json({
     success: false,
     message: contexto === 'check' ? 'Erro ao validar licenca' : 'Erro ao validar sessao',
     code: 'AUTH_SESSION_ERROR'
   });
 }
-
 router.get('/test-user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
