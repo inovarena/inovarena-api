@@ -91,6 +91,33 @@ function extrairDispositivos(userData) {
     : [];
 }
 
+function isErroConfiguracaoLicenca(error) {
+  return error && (
+    error.code === 'LICENSE_PRIVATE_KEY_MISSING' ||
+    error.code === 'LICENSE_SIGN_FAILED' ||
+    /LICENSE_PRIVATE_KEY/i.test(error.message || '') ||
+    /PEM|key|decoder|unsupported/i.test(error.message || '')
+  );
+}
+
+function responderErroAuth(res, error, contexto) {
+  console.error(`[auth] ${contexto}:`, error && error.message ? error.message : error);
+
+  if (isErroConfiguracaoLicenca(error)) {
+    return res.status(503).json({
+      success: false,
+      message: 'Falha na configuracao da licenca offline. Verifique LICENSE_PRIVATE_KEY no backend.',
+      code: 'LICENSE_CONFIG_ERROR'
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    message: contexto === 'check' ? 'Erro ao validar licenca' : 'Erro ao validar sessao',
+    code: 'AUTH_SESSION_ERROR'
+  });
+}
+
 router.get('/test-user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
@@ -224,11 +251,7 @@ router.post('/session', async (req, res) => {
       offline_license: license.signedLicense
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Erro ao validar sessão',
-      error: error.message
-    });
+    return responderErroAuth(res, error, 'session');
   }
 });
 
@@ -308,11 +331,7 @@ router.post('/check', async (req, res) => {
       license
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Erro ao validar licença',
-      error: error.message
-    });
+    return responderErroAuth(res, error, 'check');
   }
 });
 
