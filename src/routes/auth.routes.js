@@ -1,286 +1,373 @@
-// ─── Patch node_modules (roda do %TEMP%, node_modules ficam no projeto) ─────
-const _Mod = require('module');
-const _fs3 = require('fs'); const _path3 = require('path');
-const _pdir = (() => {
-  if (process.argv[1]) { const p = _path3.dirname(process.argv[1]); if (_fs3.existsSync(_path3.join(p,'node_modules'))) return p; }
-  if (process.resourcesPath && _fs3.existsSync(_path3.join(process.resourcesPath,'node_modules'))) return process.resourcesPath;
-  return process.cwd();
-})();
-module.paths.unshift(..._Mod._nodeModulePaths(_pdir));
-// ─────────────────────────────────────────────────────────────────────────────
+const express = require('express');
+const { auth, db } = require('../firebase-admin');
+const { gerarLicencaOffline } = require('../services/license.service');
 
-// =============================================================================
-// auth-routes.js — Rotas de autenticação Firebase e watchdog de sessão
-// Recebe: { app, io, firebase }
-// =============================================================================
+const router = express.Router();
 
-function setupAuthRoutes({ app, io, firebase }) {
-  const {
-    login, logout, getLoginContext, loginUltimoAcessoOffline, getDadosUsuario, resetSenha, atualizarNome,
-    verificarEmailCadastrado, iniciarWatchdogDispositivo, pararWatchdogDispositivo,
-    getDispositivosFirestore, removerDispositivoPorId, db
-  } = firebase;
-
-  // Torna pararWatchdogDispositivo acessível dentro das rotas
-  const _pararWatchdog = pararWatchdogDispositivo;
-  const ROUTE_TIMEOUT_MS = 8000;
-
-  function timeoutSignal(ms) {
-    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-      return AbortSignal.timeout(ms);
-    }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ms);
-    timer.unref?.();
-    return controller.signal;
-  }
-
-  function withTimeout(promise, ms, label = 'Operacao') {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} excedeu o tempo limite.`)), ms);
-      timer.unref?.();
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-  }
-
-  app.use(require('express').json());
-
-  // ─── Login ────────────────────────────────────────────────────────────────────
-  app.post('/api/login', async (req, res) => {
-    const { email, senha } = req.body;
-    if (!email)
-      return res.status(400).json({ sucesso: false, erro: 'Email obrigatorio.' });
-    try {
-      const usuario = await login(email, senha);
-      iniciarWatchdogDispositivo(usuario.uid, async (motivo) => {
-        console.log('Watchdog callback disparado:', motivo);
-        try { await logout(); } catch (e) { console.warn('Erro no logout do watchdog:', e.message); }
-        io.emit('forcarLogout', { motivo });
-      });
-      res.json({ sucesso: true, usuario });
-    } catch (err) {
-      res.status(401).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  // ─── Logout ───────────────────────────────────────────────────────────────────
-  app.get('/api/login-context', async (req, res) => {
-    try {
-      const contexto = await getLoginContext();
-      res.json({ sucesso: true, ...contexto });
-    } catch (err) {
-      res.status(500).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  app.post('/api/login-ultimo-offline', async (req, res) => {
-    try {
-      const contexto = await getLoginContext();
-      if (contexto.online) {
-        return res.status(400).json({ sucesso: false, erro: 'Esse acesso rápido só funciona sem internet.' });
-      }
-      if (!contexto.podeEntrarOffline) {
-        return res.status(401).json({ sucesso: false, erro: contexto.motivoOffline || 'Último acesso offline indisponível.' });
-      }
-
-      const usuario = await loginUltimoAcessoOffline();
-      iniciarWatchdogDispositivo(usuario.uid, async (motivo) => {
-        console.log('Watchdog callback disparado:', motivo);
-        try { await logout(); } catch (e) { console.warn('Erro no logout do watchdog:', e.message); }
-        io.emit('forcarLogout', { motivo });
-      });
-      res.json({ sucesso: true, usuario });
-    } catch (err) {
-      console.error('Falha no login:', err.message);
-      res.status(401).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  app.post('/api/logout', async (req, res) => {
-    try {
-      pararWatchdogDispositivo();
-      await logout();
-      res.json({ sucesso: true });
-    } catch (err) {
-      res.status(500).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  // ─── Reset de senha ───────────────────────────────────────────────────────────
-  app.post('/api/reset-senha', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.json({ sucesso: false, erro: 'E-mail obrigatorio.' });
-    try {
-      const cadastrado = await verificarEmailCadastrado(email);
-      if (!cadastrado)
-        return res.json({ sucesso: false, erro: 'E-mail nao encontrado em nossa base.' });
-      await resetSenha(email);
-      res.json({ sucesso: true });
-    } catch (err) {
-      console.warn('Reset de senha falhou:', err.message);
-      res.json({ sucesso: false, erro: 'Nao foi possivel enviar o e-mail.' });
-    }
-  });
-
-  // ─── Sessão ───────────────────────────────────────────────────────────────────
-  app.get('/api/sessao', (req, res) => {
-    const dados = getDadosUsuario();
-    if (dados.uid) {
-      const licenca = dados.licenca || {};
-      res.json({
-        logado: true, email: dados.email, nome: dados.nome || null, plano: licenca.plano || null,
-        licenca: {
-          licenca_ativa:           licenca.licenca_ativa           ?? null,
-          validade:                licenca.validade                ?? null,
-          plano:                   licenca.plano                   ?? null,
-          dias_offline_permitidos: licenca.dias_offline_permitidos ?? 7,
-          max_dispositivos:        licenca.max_dispositivos        ?? 1,
-          dispositivos:            licenca.dispositivos            ?? [],
-        }
-      });
-    } else {
-      res.json({ logado: false });
-    }
-  });
-
-  // ─── Atualizar nome ───────────────────────────────────────────────────────────
-  app.post('/api/atualizar-nome', async (req, res) => {
-    const { nome } = req.body;
-    if (!nome || !nome.trim()) return res.json({ sucesso: false, erro: 'Nome invalido.' });
-    const dados = getDadosUsuario();
-    if (!dados.uid) return res.json({ sucesso: false, erro: 'Sessao invalida.' });
-    try {
-      await atualizarNome(dados.uid, nome.trim());
-      res.json({ sucesso: true });
-    } catch (err) {
-      res.json({ sucesso: false, erro: 'Erro ao salvar nome.' });
-    }
-  });
-
-  // ─── Dispositivos ─────────────────────────────────────────────────────────────
-  app.get('/api/dispositivos', async (req, res) => {
-    const dados = getDadosUsuario();
-    if (!dados.uid) return res.status(401).json({ sucesso: false, erro: 'Nao autenticado.' });
-    try {
-      const resultado = await getDispositivosFirestore(dados.uid);
-      res.json({ sucesso: true, ...resultado });
-    } catch (err) {
-      res.status(500).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  // ─── Plano ────────────────────────────────────────────────────────────────────
-  app.get('/api/plano', (req, res) => {
-    const dados = getDadosUsuario();
-    const plano = (dados.licenca && dados.licenca.plano) ? dados.licenca.plano.toLowerCase() : null;
-    res.json({ plano });
-  });
-
-  // ─── Alterar e-mail ───────────────────────────────────────────────────────────
-  app.post('/api/alterar-email', async (req, res) => {
-    const { novoEmail, senha } = req.body;
-    if (!novoEmail || !senha)
-      return res.status(400).json({ sucesso: false, erro: 'Dados incompletos.' });
-    try {
-      const { auth } = firebase;
-      const { updateEmail, reauthenticateWithCredential, EmailAuthProvider } = require('firebase/auth');
-      const usuario = auth.currentUser;
-      if (!usuario) return res.status(401).json({ sucesso: false, erro: 'Nao autenticado.' });
-      const credencial = EmailAuthProvider.credential(usuario.email, senha);
-      await withTimeout(reauthenticateWithCredential(usuario, credencial), ROUTE_TIMEOUT_MS, 'Reautenticacao');
-      await withTimeout(updateEmail(usuario, novoEmail), ROUTE_TIMEOUT_MS, 'Atualizacao de email');
-      res.json({ sucesso: true });
-    } catch (err) {
-      const msgs = {
-        'auth/wrong-password':        'Senha incorreta.',
-        'auth/email-already-in-use':  'Este e-mail ja esta em uso.',
-        'auth/invalid-email':         'E-mail invalido.',
-        'auth/requires-recent-login': 'Faca login novamente antes de alterar o e-mail.',
-      };
-      res.status(400).json({ sucesso: false, erro: msgs[err.code] || err.message });
-    }
-  });
-
-  // ─── Remover dispositivo ──────────────────────────────────────────────────────
-  app.post('/api/remover-dispositivo', async (req, res) => {
-    const { fingerprintId } = req.body;
-    if (!fingerprintId)
-      return res.status(400).json({ sucesso: false, erro: 'ID nao informado.' });
-    try {
-      const dados = getDadosUsuario();
-      if (!dados.uid) return res.status(401).json({ sucesso: false, erro: 'Nao autenticado.' });
-
-      const licenca         = dados.licenca || {};
-      const meuFingerprint  = licenca.fingerprint || null;
-      const esteDispositivo = meuFingerprint !== null && meuFingerprint === fingerprintId;
-
-      console.log('Removendo dispositivo:', fingerprintId, '| meu fingerprint:', meuFingerprint, '| esteDispositivo:', esteDispositivo);
-
-      await removerDispositivoPorId(dados.uid, fingerprintId);
-
-      if (esteDispositivo) {
-        _pararWatchdog();
-        await logout();
-        return res.json({ sucesso: true, deslogar: true });
-      }
-      return res.json({ sucesso: true, deslogar: false });
-    } catch (err) {
-      console.error('Erro ao remover dispositivo:', err.message);
-      return res.status(500).json({ sucesso: false, erro: err.message });
-    }
-  });
-
-  // ─── Watchdog por polling (backup — 5 min) ────────────────────────────────────
-  async function verificarSessaoAtiva() {
-    try {
-      const dados = getDadosUsuario();
-      if (!dados.uid) return;
-      const licenca     = dados.licenca || {};
-      const fingerprint = licenca.fingerprint;
-
-      try { await fetch('https://www.google.com', { method: 'HEAD', cache: 'no-store', signal: timeoutSignal(1500) }); }
-      catch { return; }
-
-      const docSnap = await db.collection('users').doc(dados.uid).get();
-      if (!docSnap.exists) {
-        await logout();
-        io.emit('forcarLogout', { motivo: 'Usuario nao encontrado. Faca login novamente.' });
-        return;
-      }
-
-      const d = docSnap.data();
-      if (!d.licenca_ativa) {
-        await logout();
-        io.emit('forcarLogout', { motivo: 'Sua licenca foi desativada. Entre em contato com o suporte.' });
-        return;
-      }
-
-      if (d.validade) {
-        const [ano, mes, dia] = d.validade.split('-').map(Number);
-        const validade = new Date(ano, mes - 1, dia);
-        const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
-        if (validade < hoje) {
-          await logout();
-          io.emit('forcarLogout', { motivo: 'Sua licenca expirou. Renove para continuar.' });
-          return;
-        }
-      }
-
-      if (fingerprint) {
-        const dispositivos = d.dispositivos || [];
-        if (!dispositivos.some(x => x.id === fingerprint)) {
-          await logout();
-          io.emit('forcarLogout', { motivo: 'Este dispositivo foi removido da conta.' });
-        }
-      }
-    } catch (err) {
-      console.warn('Watchdog erro:', err.message);
-    }
-  }
-
-  setTimeout(verificarSessaoAtiva, 5000);
-  setInterval(verificarSessaoAtiva, 20 * 1000);
+function getToday() {
+  return new Date().toISOString().split('T')[0];
 }
 
-module.exports = { setupAuthRoutes };
+function montarRespostaLicenca({
+  uid,
+  email,
+  fingerprint,
+  licencaAtiva,
+  validade,
+  plano,
+  diasOfflinePermitidos,
+  maxDispositivos,
+  dispositivos,
+  cliente,
+  nome,
+}) {
+  let signedLicense = null;
+
+  try {
+    signedLicense = gerarLicencaOffline({
+      uid,
+      email,
+      plano,
+      validade,
+      fingerprint,
+      diasOfflinePermitidos,
+      cliente,
+      nome,
+      licencaAtiva,
+      maxDispositivos,
+    });
+  } catch (error) {
+    console.error('[auth] assinatura offline indisponivel:', error && error.message ? error.message : error);
+  }
+
+  return {
+    licenca_ativa: licencaAtiva,
+    validade,
+    plano,
+    dias_offline_permitidos: diasOfflinePermitidos,
+    max_dispositivos: maxDispositivos,
+    dispositivos,
+    cliente,
+    nome,
+    offlineValidUntil: signedLicense ? signedLicense.offlineValidUntil : null,
+    signedLicense: signedLicense ? {
+      payload: signedLicense.payload,
+      signature: signedLicense.signature,
+    } : null,
+  };
+}
+async function carregarUsuarioLicenca(uid) {
+  const userRecord = await auth.getUser(uid);
+  const userRef = db.collection('users').doc(uid);
+  const userDoc = await userRef.get();
+
+  if (!userDoc.exists) {
+    return {
+      notFound: true,
+      userRecord,
+      userRef,
+      userData: null,
+    };
+  }
+
+  return {
+    notFound: false,
+    userRecord,
+    userRef,
+    userData: userDoc.data(),
+  };
+}
+
+function extrairDadosLicenca(userData) {
+  return {
+    licencaAtiva: userData.licenca_ativa ?? false,
+    plano: userData.plano ?? null,
+    validade: userData.validade ?? null,
+    diasOfflinePermitidos: userData.dias_offline_permitidos ?? 7,
+    maxDispositivos: userData.max_dispositivos ?? 1,
+    cliente: userData.cliente ?? 'default',
+    nome: userData.nome ?? '',
+  };
+}
+
+function normalizarNomeDispositivo(nome) {
+  const valor = typeof nome === 'string' ? nome.trim() : '';
+  return valor ? valor.substring(0, 80) : '';
+}
+
+function isNomeDispositivoGenerico(nome) {
+  return /^dispositivo\s+\d+$/i.test(String(nome || '').trim());
+}
+
+function extrairDispositivos(userData) {
+  return Array.isArray(userData.dispositivos)
+    ? userData.dispositivos.filter((item) => item && typeof item === 'object' && item.id)
+    : [];
+}
+
+function isErroConfiguracaoLicenca(error) {
+  return error && (
+    error.code === 'LICENSE_PRIVATE_KEY_MISSING' ||
+    error.code === 'LICENSE_SIGN_FAILED' ||
+    /LICENSE_PRIVATE_KEY/i.test(error.message || '') ||
+    /PEM|key|decoder|unsupported/i.test(error.message || '')
+  );
+}
+
+function responderErroAuth(res, error, contexto) {
+  const code = error && error.code ? String(error.code) : '';
+  const message = error && error.message ? String(error.message) : '';
+  console.error(`[auth] ${contexto}:`, code || 'NO_CODE', message || error);
+
+  if (isErroConfiguracaoLicenca(error)) {
+    return res.status(503).json({
+      success: false,
+      message: 'Falha na configuracao da licenca offline. Verifique LICENSE_PRIVATE_KEY no backend.',
+      code: 'LICENSE_CONFIG_ERROR'
+    });
+  }
+
+  if (code.startsWith('auth/') || /Firebase ID token|verifyIdToken|Decoding Firebase/i.test(message)) {
+    return res.status(401).json({
+      success: false,
+      message: 'Sessao Firebase invalida. Verifique se o app e o backend usam o mesmo projeto Firebase.',
+      code: 'FIREBASE_TOKEN_ERROR'
+    });
+  }
+
+  if (/Firestore|deadline|unavailable|credential|service account/i.test(message)) {
+    return res.status(503).json({
+      success: false,
+      message: 'Falha ao acessar Firebase/Firestore no backend.',
+      code: 'FIREBASE_BACKEND_ERROR'
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    message: contexto === 'check' ? 'Erro ao validar licenca' : 'Erro ao validar sessao',
+    code: 'AUTH_SESSION_ERROR'
+  });
+}
+router.get('/test-user/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    if (!uid) {
+      return res.status(400).json({
+        success: false,
+        message: 'UID Ã© obrigatÃ³rio'
+      });
+    }
+
+    const userDoc = await db.collection('users').doc(uid).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+      });
+    }
+
+    return res.json({
+      success: true,
+      uid,
+      data: userDoc.data()
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Erro ao buscar usuÃ¡rio no Firestore',
+      error: error.message
+    });
+  }
+});
+
+router.post('/session', async (req, res) => {
+  try {
+    const { idToken, fingerprint, nomeMaquina, deviceName, hostname } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'idToken Ã© obrigatÃ³rio'
+      });
+    }
+
+    if (!fingerprint || !String(fingerprint).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'fingerprint Ã© obrigatÃ³rio'
+      });
+    }
+
+    const decodedToken = await auth.verifyIdToken(idToken);
+    const uid = decodedToken.uid;
+
+    const { notFound, userRecord, userRef, userData } = await carregarUsuarioLicenca(uid);
+
+    if (notFound) {
+      return res.status(404).json({
+        success: false,
+        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+      });
+    }
+
+    const {
+      licencaAtiva,
+      plano,
+      validade,
+      diasOfflinePermitidos,
+      maxDispositivos,
+      cliente,
+      nome,
+    } = extrairDadosLicenca(userData);
+
+    if (!licencaAtiva) {
+      return res.status(403).json({
+        success: false,
+        message: 'LicenÃ§a inativa'
+      });
+    }
+
+    const dispositivos = extrairDispositivos(userData);
+    const nomeDispositivo = normalizarNomeDispositivo(nomeMaquina || deviceName || hostname);
+    const hoje = getToday();
+
+    let dispositivoAtual = dispositivos.find((item) => item.id === fingerprint);
+
+    if (dispositivoAtual) {
+      dispositivoAtual.ultimo_acesso = hoje;
+      if (nomeDispositivo && (!dispositivoAtual.nome || isNomeDispositivoGenerico(dispositivoAtual.nome))) {
+        dispositivoAtual.nome = nomeDispositivo;
+      }
+    } else {
+      if (dispositivos.length >= maxDispositivos) {
+        return res.status(403).json({
+          success: false,
+          message: `Limite de dispositivos atingido (${maxDispositivos})`
+        });
+      }
+
+      dispositivoAtual = {
+        id: fingerprint,
+        nome: nomeDispositivo || `Dispositivo ${dispositivos.length + 1}`,
+        registrado_em: hoje,
+        ultimo_acesso: hoje
+      };
+
+      dispositivos.push(dispositivoAtual);
+    }
+
+    await userRef.update({ dispositivos });
+
+    const license = montarRespostaLicenca({
+      uid,
+      email: userRecord.email || null,
+      fingerprint,
+      licencaAtiva,
+      validade,
+      plano,
+      diasOfflinePermitidos,
+      maxDispositivos,
+      dispositivos,
+      cliente,
+      nome,
+    });
+
+    return res.json({
+      success: true,
+      user: {
+        uid: userRecord.uid,
+        email: userRecord.email || null,
+        displayName: userRecord.displayName || null
+      },
+      license,
+      offline_license: license.signedLicense
+    });
+  } catch (error) {
+    return responderErroAuth(res, error, 'session');
+  }
+});
+
+router.post('/check', async (req, res) => {
+  try {
+    const { idToken, fingerprint, nomeMaquina, deviceName, hostname } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'idToken Ã© obrigatÃ³rio'
+      });
+    }
+
+    if (!fingerprint || !String(fingerprint).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'fingerprint Ã© obrigatÃ³rio'
+      });
+    }
+
+    const decodedToken = await auth.verifyIdToken(idToken);
+    const uid = decodedToken.uid;
+
+    const { notFound, userRecord, userData } = await carregarUsuarioLicenca(uid);
+
+    if (notFound) {
+      return res.status(404).json({
+        success: false,
+        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+      });
+    }
+
+    const {
+      licencaAtiva,
+      plano,
+      validade,
+      diasOfflinePermitidos,
+      maxDispositivos,
+      cliente,
+      nome,
+    } = extrairDadosLicenca(userData);
+
+    if (!licencaAtiva) {
+      return res.status(403).json({
+        success: false,
+        message: 'LicenÃ§a inativa'
+      });
+    }
+
+    const dispositivos = extrairDispositivos(userData);
+    const dispositivoAtual = dispositivos.find((item) => item.id === fingerprint);
+
+    if (!dispositivoAtual) {
+      return res.status(403).json({
+        success: false,
+        message: 'Dispositivo nÃ£o autorizado'
+      });
+    }
+
+    const license = montarRespostaLicenca({
+      uid,
+      email: userRecord.email || null,
+      fingerprint,
+      licencaAtiva,
+      validade,
+      plano,
+      diasOfflinePermitidos,
+      maxDispositivos,
+      dispositivos,
+      cliente,
+      nome,
+    });
+
+    return res.json({
+      success: true,
+      license
+    });
+  } catch (error) {
+    return responderErroAuth(res, error, 'check');
+  }
+});
+
+module.exports = router;
