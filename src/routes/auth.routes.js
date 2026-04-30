@@ -90,6 +90,14 @@ function extrairDadosLicenca(userData) {
   };
 }
 
+function normalizarNomeDispositivo(nome) {
+  const valor = typeof nome === 'string' ? nome.trim() : '';
+  return valor ? valor.substring(0, 80) : '';
+}
+
+function isNomeDispositivoGenerico(nome) {
+  return /^dispositivo\s+\d+$/i.test(String(nome || '').trim());
+}
 function extrairDispositivos(userData) {
   return Array.isArray(userData.dispositivos)
     ? userData.dispositivos.filter((item) => item && typeof item === 'object' && item.id)
@@ -176,7 +184,7 @@ router.get('/test-user/:uid', async (req, res) => {
 
 router.post('/session', async (req, res) => {
   try {
-    const { idToken, fingerprint } = req.body;
+    const { idToken, fingerprint, nomeMaquina, deviceName, hostname } = req.body;
 
     if (!idToken) {
       return res.status(400).json({
@@ -222,12 +230,16 @@ router.post('/session', async (req, res) => {
     }
 
     const dispositivos = extrairDispositivos(userData);
+    const nomeDispositivo = normalizarNomeDispositivo(nomeMaquina || deviceName || hostname);
     const hoje = getToday();
 
     let dispositivoAtual = dispositivos.find((item) => item.id === fingerprint);
 
     if (dispositivoAtual) {
       dispositivoAtual.ultimo_acesso = hoje;
+      if (nomeDispositivo && (!dispositivoAtual.nome || isNomeDispositivoGenerico(dispositivoAtual.nome))) {
+        dispositivoAtual.nome = nomeDispositivo;
+      }
     } else {
       if (dispositivos.length >= maxDispositivos) {
         return res.status(403).json({
@@ -238,7 +250,7 @@ router.post('/session', async (req, res) => {
 
       dispositivoAtual = {
         id: fingerprint,
-        nome: `Dispositivo ${dispositivos.length + 1}`,
+        nome: nomeDispositivo || `Dispositivo ${dispositivos.length + 1}`,
         registrado_em: hoje,
         ultimo_acesso: hoje
       };
@@ -279,7 +291,7 @@ router.post('/session', async (req, res) => {
 
 router.post('/check', async (req, res) => {
   try {
-    const { idToken, fingerprint } = req.body;
+    const { idToken, fingerprint, nomeMaquina, deviceName, hostname } = req.body;
 
     if (!idToken) {
       return res.status(400).json({
