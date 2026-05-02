@@ -99,10 +99,106 @@ function isNomeDispositivoGenerico(nome) {
   return /^dispositivo\s+\d+$/i.test(String(nome || '').trim());
 }
 
+function normalizarChaveNomeDispositivo(nome) {
+  return normalizarNomeDispositivo(nome).toLowerCase();
+}
+
 function extrairDispositivos(userData) {
   return Array.isArray(userData.dispositivos)
     ? userData.dispositivos.filter((item) => item && typeof item === 'object' && item.id)
     : [];
+}
+
+function encontrarDispositivoPorNome(dispositivos, nomeDispositivo) {
+  const nomeChave = normalizarChaveNomeDispositivo(nomeDispositivo);
+  if (!nomeChave) return null;
+
+  return dispositivos.find((item) => {
+    if (!item || !item.nome || isNomeDispositivoGenerico(item.nome)) return false;
+    return normalizarChaveNomeDispositivo(item.nome) === nomeChave;
+  }) || null;
+}
+
+function anexarIdAnterior(dispositivo, idAnterior) {
+  if (!dispositivo || !idAnterior || dispositivo.id === idAnterior) return;
+  const anteriores = Array.isArray(dispositivo.ids_anteriores)
+    ? dispositivo.ids_anteriores.filter(Boolean)
+    : [];
+  if (!anteriores.includes(idAnterior)) anteriores.push(idAnterior);
+  dispositivo.ids_anteriores = anteriores.slice(-5);
+}
+
+function reconciliarDispositivo({
+  dispositivos,
+  fingerprint,
+  nomeDispositivo,
+  hoje,
+  maxDispositivos,
+  permitirCriar,
+}) {
+  let alterado = false;
+  let dispositivoAtual = dispositivos.find((item) => item.id === fingerprint) || null;
+  const nomeChave = normalizarChaveNomeDispositivo(nomeDispositivo);
+
+  if (!dispositivoAtual && nomeChave) {
+    const dispositivoMesmoNome = encontrarDispositivoPorNome(dispositivos, nomeDispositivo);
+    if (dispositivoMesmoNome) {
+      anexarIdAnterior(dispositivoMesmoNome, dispositivoMesmoNome.id);
+      dispositivoMesmoNome.id = fingerprint;
+      dispositivoAtual = dispositivoMesmoNome;
+      alterado = true;
+    }
+  }
+
+  if (dispositivoAtual) {
+    if (dispositivoAtual.ultimo_acesso !== hoje) {
+      dispositivoAtual.ultimo_acesso = hoje;
+      alterado = true;
+    }
+
+    if (nomeDispositivo && (!dispositivoAtual.nome || isNomeDispositivoGenerico(dispositivoAtual.nome))) {
+      dispositivoAtual.nome = nomeDispositivo;
+      alterado = true;
+    }
+
+    for (let i = dispositivos.length - 1; i >= 0; i -= 1) {
+      const item = dispositivos[i];
+      if (!item || item === dispositivoAtual) continue;
+
+      const mesmoId = item.id === fingerprint;
+      const mesmoNome = nomeChave && item.nome && !isNomeDispositivoGenerico(item.nome)
+        && normalizarChaveNomeDispositivo(item.nome) === nomeChave;
+
+      if (mesmoId || mesmoNome) {
+        anexarIdAnterior(dispositivoAtual, item.id);
+        if (!dispositivoAtual.registrado_em && item.registrado_em) {
+          dispositivoAtual.registrado_em = item.registrado_em;
+        }
+        dispositivos.splice(i, 1);
+        alterado = true;
+      }
+    }
+
+    return { dispositivoAtual, alterado, limiteAtingido: false };
+  }
+
+  if (!permitirCriar) {
+    return { dispositivoAtual: null, alterado: false, limiteAtingido: false };
+  }
+
+  if (dispositivos.length >= maxDispositivos) {
+    return { dispositivoAtual: null, alterado: false, limiteAtingido: true };
+  }
+
+  dispositivoAtual = {
+    id: fingerprint,
+    nome: nomeDispositivo || `Dispositivo ${dispositivos.length + 1}`,
+    registrado_em: hoje,
+    ultimo_acesso: hoje
+  };
+  dispositivos.push(dispositivoAtual);
+
+  return { dispositivoAtual, alterado: true, limiteAtingido: false };
 }
 
 function isErroConfiguracaoLicenca(error) {
@@ -156,7 +252,7 @@ router.get('/test-user/:uid', async (req, res) => {
     if (!uid) {
       return res.status(400).json({
         success: false,
-        message: 'UID Ã© obrigatÃ³rio'
+        message: 'UID é obrigatório'
       });
     }
 
@@ -165,7 +261,7 @@ router.get('/test-user/:uid', async (req, res) => {
     if (!userDoc.exists) {
       return res.status(404).json({
         success: false,
-        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+        message: 'Usuário não encontrado no Firestore'
       });
     }
 
@@ -177,7 +273,7 @@ router.get('/test-user/:uid', async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: 'Erro ao buscar usuÃ¡rio no Firestore',
+      message: 'Erro ao buscar usuário no Firestore',
       error: error.message
     });
   }
@@ -190,14 +286,14 @@ router.post('/session', async (req, res) => {
     if (!idToken) {
       return res.status(400).json({
         success: false,
-        message: 'idToken Ã© obrigatÃ³rio'
+        message: 'idToken é obrigatório'
       });
     }
 
     if (!fingerprint || !String(fingerprint).trim()) {
       return res.status(400).json({
         success: false,
-        message: 'fingerprint Ã© obrigatÃ³rio'
+        message: 'fingerprint é obrigatório'
       });
     }
 
@@ -209,7 +305,7 @@ router.post('/session', async (req, res) => {
     if (notFound) {
       return res.status(404).json({
         success: false,
-        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+        message: 'Usuário não encontrado no Firestore'
       });
     }
 
@@ -226,7 +322,7 @@ router.post('/session', async (req, res) => {
     if (!licencaAtiva) {
       return res.status(403).json({
         success: false,
-        message: 'LicenÃ§a inativa'
+        message: 'Licença inativa'
       });
     }
 
@@ -234,32 +330,25 @@ router.post('/session', async (req, res) => {
     const nomeDispositivo = normalizarNomeDispositivo(nomeMaquina || deviceName || hostname);
     const hoje = getToday();
 
-    let dispositivoAtual = dispositivos.find((item) => item.id === fingerprint);
+    const resultadoDispositivo = reconciliarDispositivo({
+      dispositivos,
+      fingerprint,
+      nomeDispositivo,
+      hoje,
+      maxDispositivos,
+      permitirCriar: true,
+    });
 
-    if (dispositivoAtual) {
-      dispositivoAtual.ultimo_acesso = hoje;
-      if (nomeDispositivo && (!dispositivoAtual.nome || isNomeDispositivoGenerico(dispositivoAtual.nome))) {
-        dispositivoAtual.nome = nomeDispositivo;
-      }
-    } else {
-      if (dispositivos.length >= maxDispositivos) {
-        return res.status(403).json({
-          success: false,
-          message: `Limite de dispositivos atingido (${maxDispositivos})`
-        });
-      }
-
-      dispositivoAtual = {
-        id: fingerprint,
-        nome: nomeDispositivo || `Dispositivo ${dispositivos.length + 1}`,
-        registrado_em: hoje,
-        ultimo_acesso: hoje
-      };
-
-      dispositivos.push(dispositivoAtual);
+    if (resultadoDispositivo.limiteAtingido) {
+      return res.status(403).json({
+        success: false,
+        message: `Limite de dispositivos atingido (${maxDispositivos})`
+      });
     }
 
-    await userRef.update({ dispositivos });
+    if (resultadoDispositivo.alterado) {
+      await userRef.update({ dispositivos });
+    }
 
     const license = montarRespostaLicenca({
       uid,
@@ -297,26 +386,26 @@ router.post('/check', async (req, res) => {
     if (!idToken) {
       return res.status(400).json({
         success: false,
-        message: 'idToken Ã© obrigatÃ³rio'
+        message: 'idToken é obrigatório'
       });
     }
 
     if (!fingerprint || !String(fingerprint).trim()) {
       return res.status(400).json({
         success: false,
-        message: 'fingerprint Ã© obrigatÃ³rio'
+        message: 'fingerprint é obrigatório'
       });
     }
 
     const decodedToken = await auth.verifyIdToken(idToken);
     const uid = decodedToken.uid;
 
-    const { notFound, userRecord, userData } = await carregarUsuarioLicenca(uid);
+    const { notFound, userRecord, userRef, userData } = await carregarUsuarioLicenca(uid);
 
     if (notFound) {
       return res.status(404).json({
         success: false,
-        message: 'UsuÃ¡rio nÃ£o encontrado no Firestore'
+        message: 'Usuário não encontrado no Firestore'
       });
     }
 
@@ -333,18 +422,31 @@ router.post('/check', async (req, res) => {
     if (!licencaAtiva) {
       return res.status(403).json({
         success: false,
-        message: 'LicenÃ§a inativa'
+        message: 'Licença inativa'
       });
     }
 
     const dispositivos = extrairDispositivos(userData);
-    const dispositivoAtual = dispositivos.find((item) => item.id === fingerprint);
+    const nomeDispositivo = normalizarNomeDispositivo(nomeMaquina || deviceName || hostname);
+    const hoje = getToday();
+    const resultadoDispositivo = reconciliarDispositivo({
+      dispositivos,
+      fingerprint,
+      nomeDispositivo,
+      hoje,
+      maxDispositivos,
+      permitirCriar: false,
+    });
 
-    if (!dispositivoAtual) {
+    if (!resultadoDispositivo.dispositivoAtual) {
       return res.status(403).json({
         success: false,
-        message: 'Dispositivo nÃ£o autorizado'
+        message: 'Dispositivo não autorizado'
       });
+    }
+
+    if (resultadoDispositivo.alterado) {
+      await userRef.update({ dispositivos });
     }
 
     const license = montarRespostaLicenca({
@@ -371,3 +473,5 @@ router.post('/check', async (req, res) => {
 });
 
 module.exports = router;
+
+
